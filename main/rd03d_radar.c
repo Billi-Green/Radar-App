@@ -14,12 +14,16 @@
 #define RADAR_CHANNEL 1
 #define RADAR_MAX_RANGE_MM 8000
 #define RADAR_RANGE_RINGS 4
-#define RADAR_HALF_ANGLE_DEG 40
-#define RADAR_CONE_SIN_MILLI 643
-#define RADAR_CONE_COS_MILLI 766
-#define RADAR_SWEEP_STEP_MS 16
-#define RADAR_SWEEP_STEP_DEG 1
+#define RADAR_HALF_ANGLE_DEG 50
+#define RADAR_CONE_SIN_MILLI 766
+#define RADAR_CONE_COS_MILLI 643
+#define RADAR_EDGE_MARGIN 8
+#define RADAR_TARGET_DOT_SIZE 9
+#define RADAR_SWEEP_STEP_MS 50
+#define RADAR_SWEEP_STEP_DEG 2
 #define RADAR_DATA_TIMEOUT_MS 1200
+#define RADAR_BATTERY_TIMEOUT_MS 20000
+#define RADAR_MAX_MESSAGES_PER_TICK 16
 #define RADAR_PEER_TIMEOUT_MS 10000
 #define RADAR_HELLO_INTERVAL_MS 2000
 #define RADAR_CONE_GREEN 0x00E060
@@ -54,6 +58,10 @@ typedef struct {
     uint32_t last_peer_ms;
     uint32_t last_data_ms;
     uint32_t sequence;
+    int battery_mv;
+    int battery_percent;
+    bool battery_valid;
+    uint32_t battery_updated_ms;
     radar_target_t targets[RADAR_MAX_TARGETS];
 } radar_node_t;
 
@@ -89,6 +97,8 @@ static radar_node_t nodes[RADAR_MAX_NODES];
 static int node_count;
 static int view_slot;
 static radar_page_t page;
+/* Touch callbacks run on the LVGL task; page creation runs on the app task. */
+static volatile bool radar_open_requested;
 static uint32_t last_announce_ms;
 static bool radar_background_drawn;
 static int32_t radar_canvas_width;
@@ -100,6 +110,9 @@ static int sweep_angle_deg;
 static int sweep_direction;
 static uint32_t sweep_elapsed_ms;
 static int sweep_drawn_angle_deg;
+static char last_radar_header[64];
+static char last_radar_data[256];
+static bool radar_text_valid;
 
 char *strcpy(char *dst, const char *src) __attribute__((weak));
 char *strcpy(char *dst, const char *src) {
@@ -158,6 +171,7 @@ static int ensure_node(const uint8_t mac[6], const char *name) {
     index = node_count++;
     memset(&nodes[index], 0, sizeof(nodes[index]));
     nodes[index].used = true;
+    nodes[index].battery_percent = -1;
     memcpy(nodes[index].mac, mac, 6);
     snprintf(nodes[index].name, sizeof(nodes[index].name), "%s",
              name && name[0] ? name : "RD03D Radar");
@@ -245,6 +259,7 @@ static void delete_screen(void) {
     radar_label = NULL;
     radar_data_label = NULL;
     radar_background_drawn = false;
+    radar_text_valid = false;
     radar_canvas_width = 0;
     radar_canvas_height = 0;
     sweep_angle_deg = 0;
@@ -429,10 +444,35 @@ static bool parse_telemetry(const char *text, uint32_t *sequence,
     return true;
 }
 
+static bool parse_battery(const char *text, int *millivolts, int *percent) {
+    static const char prefix[] = "RADAR_BATTERY,";
+    if (!text || strncmp(text, prefix, sizeof(prefix) - 1) != 0) return false;
+    char copy[40];
+    const char *payload = text + sizeof(prefix) - 1;
+    size_t length = 0;
+    while (length < sizeof(copy) && payload[length]) ++length;
+    if (length == sizeof(copy)) return false;
+    memcpy(copy, payload, length + 1);
+    char *separator = strchr(copy, ',');
+    if (!separator) return false;
+    *separator = '\0';
+    char *cursor = copy;
+    long mv, charge;
+    if (!parse_long_field(&cursor, &mv) || *cursor != '\0') return false;
+    cursor = separator + 1;
+    if (!parse_long_field(&cursor, &charge) || *cursor != '\0') return false;
+    if (!((mv == -1 && charge == -1) ||
+          (mv >= 2500 && mv <= 4500 && charge >= 0 && charge <= 100))) return false;
+    *millivolts = (int)mv;
+    *percent = (int)charge;
+    return true;
+}
+
 static void drain_messages(void) {
     if (!api->espnow_receive) return;
     ghostesp_espnow_message_t message;
-    while (api->espnow_receive(&message)) {
+    for (int processed = 0; processed < RADAR_MAX_MESSAGES_PER_TICK &&
+                            api->espnow_receive(&message); ++processed) {
         int index = find_node(message.sender_mac);
         if (index < 0 && is_radar_name(message.sender_name)) {
             int previous_count = node_count;
@@ -451,6 +491,16 @@ static void drain_messages(void) {
             nodes[index].streaming = false;
             connect_ui_dirty = true;
             radar_logf("RD03D: ack stop node=%d", index);
+            continue;
+        }
+
+        int battery_mv, battery_percent;
+        if (parse_battery(message.text, &battery_mv, &battery_percent)) {
+            nodes[index].battery_mv = battery_mv;
+            nodes[index].battery_percent = battery_percent;
+            nodes[index].battery_valid = battery_mv >= 0;
+            nodes[index].battery_updated_ms = now_ms();
+            nodes[index].last_peer_ms = nodes[index].battery_updated_ms;
             continue;
         }
 
@@ -828,6 +878,7 @@ static const int16_t radar_sweep_sin_milli[RADAR_HALF_ANGLE_DEG + 1] = {
     191, 208, 225, 242, 259, 276, 292, 309, 326, 342,
     358, 375, 391, 407, 423, 438, 454, 469, 485, 500,
     515, 530, 545, 559, 574, 588, 602, 616, 629, 643,
+    656, 669, 682, 695, 707, 719, 731, 743, 755, 766,
 };
 
 static const int16_t radar_sweep_cos_milli[RADAR_HALF_ANGLE_DEG + 1] = {
@@ -835,20 +886,22 @@ static const int16_t radar_sweep_cos_milli[RADAR_HALF_ANGLE_DEG + 1] = {
     982, 978, 974, 970, 966, 961, 956, 951, 946, 940,
     934, 927, 921, 914, 906, 899, 891, 883, 875, 866,
     857, 848, 839, 829, 819, 809, 799, 788, 777, 766,
+    755, 743, 731, 719, 707, 695, 682, 669, 656, 643,
 };
 
 static void get_radar_geometry(int *cx, int *cy, int *radius) {
     int width = radar_canvas_width;
     int height = radar_canvas_height;
     *cx = width / 2;
-    *cy = height - 2;
+    *cy = height - RADAR_EDGE_MARGIN;
 
-    /* Size the 80-degree cone from its actual footprint and use
+    /* Size the 100-degree cone from its actual footprint and use
      * nearly all of the available vertical canvas. */
-    int by_height = height - 4;
-    int by_width = width * 1000 / (RADAR_CONE_SIN_MILLI * 2) - 2;
+    int by_height = height - RADAR_EDGE_MARGIN * 2;
+    int by_width = (width - RADAR_EDGE_MARGIN * 2) * 1000 /
+                   (RADAR_CONE_SIN_MILLI * 2);
     *radius = by_height < by_width ? by_height : by_width;
-    if (*radius < 20) *radius = 20;
+    if (*radius < 1) *radius = 1;
 }
 
 static void position_range_labels(void) {
@@ -859,10 +912,8 @@ static void position_range_labels(void) {
         if (!range_labels[i]) continue;
         int ring_radius = radius * (i + 1) / RADAR_RANGE_RINGS;
         int label_width = 24;
-        int label_offset = i == RADAR_RANGE_RINGS - 2 ? 18 : 10;
-        int x = cx + ring_radius * RADAR_CONE_SIN_MILLI / 1000 + label_offset;
-        if (i == RADAR_RANGE_RINGS - 2)
-            x = radar_canvas_width - label_width - 2;
+        /* Keep labels inside the cone rather than beyond the canvas edge. */
+        int x = cx + ring_radius * RADAR_CONE_SIN_MILLI / 1000 - label_width - 3;
         int y = cy - ring_radius * RADAR_CONE_COS_MILLI / 1000 - 7;
         int max_x = radar_canvas_width - label_width - 2;
         int max_y = radar_canvas_height - 14;
@@ -878,29 +929,28 @@ static void position_range_labels(void) {
 
 static void draw_radar_background(void) {
     if (!canvas || !api->ui_canvas_fill) return;
-
-    int32_t width = api->ui_obj_get_width ? api->ui_obj_get_width(canvas) : 220;
-    int32_t height = api->ui_obj_get_height ? api->ui_obj_get_height(canvas) : 180;
-    if (width < 16) width = 16;
-    if (height < 16) height = 16;
-    if (radar_background_drawn && width == radar_canvas_width &&
-        height == radar_canvas_height) return;
-
-    radar_canvas_width = width;
-    radar_canvas_height = height;
+    if (radar_background_drawn) return;
     radar_background_drawn = true;
 
     api->ui_canvas_fill(canvas, theme.bg);
     int cx, cy, radius;
     get_radar_geometry(&cx, &cy, &radius);
 
-    if (api->ui_canvas_draw_arc) {
+    /* Polylines avoid the much more expensive off-screen arc renderer. */
+    if (api->ui_canvas_draw_line) {
         for (int ring = 1; ring <= RADAR_RANGE_RINGS; ++ring) {
-            api->ui_canvas_draw_arc(canvas, cx, cy,
-                                    radius * ring / RADAR_RANGE_RINGS,
-                                    270 - RADAR_HALF_ANGLE_DEG,
-                                    270 + RADAR_HALF_ANGLE_DEG,
-                                    RADAR_GRID_GREEN, 1);
+            int ring_radius = radius * ring / RADAR_RANGE_RINGS;
+            ghostesp_point_t points[21];
+            for (int i = 0; i < 21; ++i) {
+                int angle = i * 5 - RADAR_HALF_ANGLE_DEG;
+                int abs_angle = angle < 0 ? -angle : angle;
+                int direction = angle < 0 ? -1 : 1;
+                points[i].x = cx + direction * ring_radius *
+                              radar_sweep_sin_milli[abs_angle] / 1000;
+                points[i].y = cy - ring_radius *
+                              radar_sweep_cos_milli[abs_angle] / 1000;
+            }
+            api->ui_canvas_draw_line(canvas, points, 21, RADAR_GRID_GREEN, 1);
         }
     }
     if (api->ui_canvas_draw_line) {
@@ -943,6 +993,8 @@ static void update_sweep_line(void) {
 }
 
 static void advance_sweep(uint32_t elapsed_ms) {
+    /* Don't spend an unbounded time catching up after a stalled frame. */
+    if (elapsed_ms > 250) elapsed_ms = 250;
     sweep_elapsed_ms += elapsed_ms;
     while (sweep_elapsed_ms >= RADAR_SWEEP_STEP_MS) {
         sweep_elapsed_ms -= RADAR_SWEEP_STEP_MS;
@@ -958,7 +1010,7 @@ static void advance_sweep(uint32_t elapsed_ms) {
 }
 
 static void update_radar_marker(void) {
-    if (!canvas || !api->ui_line_set_points) return;
+    if (!canvas || !api->ui_obj_set_pos) return;
     draw_radar_background();
 
     int index = selected_node_at(view_slot);
@@ -1000,14 +1052,8 @@ static void update_radar_marker(void) {
 
         if (!marker_visible[target_id] || marker_x[target_id] != px ||
             marker_y[target_id] != py) {
-            ghostesp_point_t points[5] = {
-                {px - 4, py - 4},
-                {px + 4, py - 4},
-                {px + 4, py + 4},
-                {px - 4, py + 4},
-                {px - 4, py - 4},
-            };
-            api->ui_line_set_points(marker, points, 5);
+            api->ui_obj_set_pos(marker, px - RADAR_TARGET_DOT_SIZE / 2,
+                                py - RADAR_TARGET_DOT_SIZE / 2);
             marker_x[target_id] = px;
             marker_y[target_id] = py;
         }
@@ -1040,6 +1086,7 @@ static void update_radar_labels(void) {
         if (radar_data_label && api->ui_label_set_text)
             api->ui_label_set_text(radar_data_label,
                                    narrow ? "Use Connect" : "Use Connect to select a radar");
+        radar_text_valid = false;
         return;
     }
 
@@ -1061,17 +1108,14 @@ static void update_radar_labels(void) {
     }
 
     if (detected_count == 0) {
-        if (radar_label && api->ui_label_set_text) {
-            snprintf(header, sizeof(header), narrow ? "No target %d/%d" :
-                     "No target  |  Radar %d/%d", view_slot + 1, total);
-        }
-        snprintf(data, sizeof(data), narrow ? "2m 4m 6m 8m | 80deg" :
-                 "Range 2m  4m  6m  8m  |  FOV 80 deg");
+        snprintf(header, sizeof(header), narrow ? "No target %d/%d" :
+                 "No target  |  Radar %d/%d", view_slot + 1, total);
+        snprintf(data, sizeof(data), narrow ? "2m 4m 6m 8m | 100deg" :
+                 "Range 2m  4m  6m  8m  |  FOV 100 deg");
     } else {
-        if (radar_label && api->ui_label_set_text)
-            snprintf(header, sizeof(header), narrow ? "%d targets %d/%d" :
-                     "%d targets  |  Radar %d/%d", detected_count,
-                     view_slot + 1, total);
+        snprintf(header, sizeof(header), narrow ? "%d targets %d/%d" :
+                 "%d targets  |  Radar %d/%d", detected_count,
+                 view_slot + 1, total);
 
         size_t used = 0;
         for (int target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
@@ -1103,10 +1147,28 @@ static void update_radar_labels(void) {
         if (used > 0 && used < sizeof(data) && data[used - 1] == '\n')
             data[used - 1] = '\0';
     }
-    if (radar_label && api->ui_label_set_text)
+    size_t header_used = strlen(header);
+    if (header_used < sizeof(header)) {
+        if (node->battery_valid &&
+            now - node->battery_updated_ms <= RADAR_BATTERY_TIMEOUT_MS) {
+            snprintf(header + header_used, sizeof(header) - header_used,
+                     " | Bat %d%% %d.%02dV", node->battery_percent,
+                     node->battery_mv / 1000, (node->battery_mv % 1000) / 10);
+        } else {
+            snprintf(header + header_used, sizeof(header) - header_used, " | Bat --");
+        }
+    }
+    if (radar_label && api->ui_label_set_text &&
+        (!radar_text_valid || strcmp(header, last_radar_header) != 0)) {
         api->ui_label_set_text(radar_label, header);
-    if (radar_data_label && api->ui_label_set_text)
+        snprintf(last_radar_header, sizeof(last_radar_header), "%s", header);
+    }
+    if (radar_data_label && api->ui_label_set_text &&
+        (!radar_text_valid || strcmp(data, last_radar_data) != 0)) {
         api->ui_label_set_text(radar_data_label, data);
+        snprintf(last_radar_data, sizeof(last_radar_data), "%s", data);
+    }
+    radar_text_valid = true;
 }
 
 static void previous_radar(void *user) {
@@ -1126,7 +1188,6 @@ static void next_radar(void *user) {
 }
 
 static void show_radar(void) {
-    page = PAGE_RADAR;
     refresh_nodes();
     sweep_angle_deg = 0;
     sweep_direction = 1;
@@ -1135,6 +1196,7 @@ static void show_radar(void) {
     if (radar_screen) {
         radar_logf("RD03D: show radar cached selected=%d", selected_count());
         activate_screen(radar_screen);
+        page = PAGE_RADAR;
         update_radar_labels();
         draw_radar();
         return;
@@ -1155,7 +1217,7 @@ static void show_radar(void) {
     int32_t header_height = tiny ? 14 : 16;
     int32_t data_height = tiny ? 14 : 48;
     int32_t nav_button_height = narrow ? (layout.compact ? 22 : 26) : 30;
-    int32_t nav_height = narrow ? nav_button_height * 2 + gap : nav_button_height;
+    int32_t nav_height = nav_button_height;
     int32_t canvas_y = header_height + gap + data_height + gap;
     int32_t canvas_height = layout.content_h - canvas_y - nav_height - gap - margin;
     if (canvas_height < 32 && !tiny) {
@@ -1165,10 +1227,12 @@ static void show_radar(void) {
     }
     if (canvas_height < 24) canvas_height = 24;
 
-    /* Keep the page in a measured column so the fixed canvas and navigation
-     * remain inside the 320x240 content area. */
+    /* Reserve the header, data and navigation before sizing the plot. */
     if (api->ui_obj_set_flex_flow)
         api->ui_obj_set_flex_flow(screen, GHOSTESP_FLEX_FLOW_COLUMN);
+    if (api->ui_obj_set_flex_align)
+        api->ui_obj_set_flex_align(screen, GHOSTESP_FLEX_ALIGN_START,
+                                   GHOSTESP_FLEX_ALIGN_CENTER, GHOSTESP_FLEX_ALIGN_CENTER);
     if (api->ui_obj_set_pad)
         api->ui_obj_set_pad(screen, margin, margin, 0, margin);
     if (api->ui_obj_set_pad_row) api->ui_obj_set_pad_row(screen, gap);
@@ -1184,9 +1248,37 @@ static void show_radar(void) {
         api->ui_obj_set_size(radar_data_label, width, data_height);
 
     if (api->ui_canvas_create) {
-        canvas = api->ui_canvas_create(screen, width, canvas_height);
+        int32_t plot_width = width;
+        int32_t plot_height = canvas_height;
+        /* The cone is width-limited in portrait and height-limited in landscape.
+         * Allocate only the footprint it can actually use. */
+        int32_t width_limited_height =
+            (plot_width - RADAR_EDGE_MARGIN * 2) * 1000 /
+            (RADAR_CONE_SIN_MILLI * 2) + RADAR_EDGE_MARGIN * 2;
+        if (plot_height > width_limited_height) plot_height = width_limited_height;
+        int32_t height_limited_width =
+            (plot_height - RADAR_EDGE_MARGIN * 2) * RADAR_CONE_SIN_MILLI * 2 /
+            1000 + RADAR_EDGE_MARGIN * 2;
+        if (plot_width > height_limited_width) plot_width = height_limited_width;
+        canvas = api->ui_canvas_create(screen, plot_width, plot_height);
+        if (!canvas && (plot_width > 192 || plot_height > 176)) {
+            radar_logf("RD03D: canvas %ldx%ld failed; retrying smaller",
+                       (long)plot_width, (long)plot_height);
+            if (plot_width > 192) plot_width = 192;
+            if (plot_height > 176) plot_height = 176;
+            canvas = api->ui_canvas_create(screen, plot_width, plot_height);
+        }
+        if (!canvas && plot_width > 128 && plot_height > 96) {
+            radar_logf("RD03D: canvas %ldx%ld failed; retrying compact",
+                       (long)plot_width, (long)plot_height);
+            plot_width = 128;
+            plot_height = 96;
+            canvas = api->ui_canvas_create(screen, plot_width, plot_height);
+        }
+        radar_canvas_width = plot_width;
+        radar_canvas_height = plot_height;
         if (canvas && api->ui_obj_set_size)
-            api->ui_obj_set_size(canvas, width, canvas_height);
+            api->ui_obj_set_size(canvas, plot_width, plot_height);
         if (canvas && api->ui_line_create) {
             sweep_line = api->ui_line_create(canvas);
             if (sweep_line) {
@@ -1197,17 +1289,20 @@ static void show_radar(void) {
                 if (api->ui_obj_set_visible)
                     api->ui_obj_set_visible(sweep_line, false);
             }
+        }
+        if (canvas && api->ui_card_create) {
             for (int target_id = 0; target_id < RADAR_MAX_TARGETS; ++target_id) {
-                target_markers[target_id] = api->ui_line_create(canvas);
-                if (target_markers[target_id]) {
-                    if (api->ui_line_set_color)
-                        api->ui_line_set_color(target_markers[target_id],
-                                               RADAR_TARGET_RED);
-                    if (api->ui_line_set_width)
-                        api->ui_line_set_width(target_markers[target_id], 2);
-                    if (api->ui_obj_set_visible)
-                        api->ui_obj_set_visible(target_markers[target_id], false);
-                }
+                ghostesp_ui_obj_t dot = api->ui_card_create(canvas);
+                target_markers[target_id] = dot;
+                if (!dot) continue;
+                if (api->ui_obj_set_size)
+                    api->ui_obj_set_size(dot, RADAR_TARGET_DOT_SIZE, RADAR_TARGET_DOT_SIZE);
+                if (api->ui_obj_set_bg_color) api->ui_obj_set_bg_color(dot, RADAR_TARGET_RED);
+                if (api->ui_obj_set_border_width) api->ui_obj_set_border_width(dot, 0);
+                if (api->ui_obj_set_radius) api->ui_obj_set_radius(dot, RADAR_TARGET_DOT_SIZE / 2 + 1);
+                if (api->ui_obj_set_pad) api->ui_obj_set_pad(dot, 0, 0, 0, 0);
+                if (api->ui_obj_set_scrollable) api->ui_obj_set_scrollable(dot, false);
+                if (api->ui_obj_set_visible) api->ui_obj_set_visible(dot, false);
             }
         }
         if (canvas && api->ui_label_create) {
@@ -1222,35 +1317,43 @@ static void show_radar(void) {
             }
         }
     }
+    if (!canvas) {
+        radar_logf("RD03D: radar canvas creation failed; free heap=%lu",
+                   (unsigned long)(api->system_free_heap ? api->system_free_heap() : 0));
+        add_label(screen, "Radar display unavailable", GHOSTESP_FONT_BODY, theme.text);
+        if (api->toast) api->toast("Unable to allocate radar display");
+    }
     update_radar_labels();
     draw_radar();
 
     ghostesp_ui_obj_t nav = api->ui_card_create ? api->ui_card_create(screen) : screen;
     if (nav != screen) {
-        style_flat_container(nav, narrow ? GHOSTESP_FLEX_FLOW_COLUMN :
-                                      GHOSTESP_FLEX_FLOW_ROW);
+        style_flat_container(nav, GHOSTESP_FLEX_FLOW_ROW);
         if (api->ui_obj_set_size)
             api->ui_obj_set_size(nav, width, nav_height);
         if (api->ui_obj_set_flex_align)
-            api->ui_obj_set_flex_align(nav, narrow ? GHOSTESP_FLEX_ALIGN_START :
-                                                GHOSTESP_FLEX_ALIGN_SPACE_BETWEEN,
+            api->ui_obj_set_flex_align(nav, GHOSTESP_FLEX_ALIGN_SPACE_BETWEEN,
                                        GHOSTESP_FLEX_ALIGN_CENTER,
                                        GHOSTESP_FLEX_ALIGN_CENTER);
-        if (narrow) {
-            if (api->ui_obj_set_pad_row) api->ui_obj_set_pad_row(nav, gap);
-        } else if (api->ui_obj_set_pad_column) {
+        if (api->ui_obj_set_pad_column) {
             api->ui_obj_set_pad_column(nav, gap);
         }
     }
 
-    int32_t button_width = narrow ? width : (width - gap) / 2;
-    ghostesp_ui_obj_t previous = add_radar_button(nav, "Previous", previous_radar,
-                                                  button_width);
+    int32_t button_width = (width - gap * 2) / 3;
+    ghostesp_ui_obj_t previous = add_radar_button(nav, narrow ? "Prev" : "Previous", previous_radar,
+                                                   button_width);
     ghostesp_ui_obj_t next = add_radar_button(nav, "Next", next_radar, button_width);
+    ghostesp_ui_obj_t back = add_radar_button(nav, "Back", show_home_callback, button_width);
     if (previous && api->ui_obj_set_height)
         api->ui_obj_set_height(previous, nav_button_height);
     if (next && api->ui_obj_set_height)
         api->ui_obj_set_height(next, nav_button_height);
+    if (back && api->ui_obj_set_height)
+        api->ui_obj_set_height(back, nav_button_height);
+    page = PAGE_RADAR;
+    radar_logf("RD03D: radar page ready %ldx%ld", (long)radar_canvas_width,
+               (long)radar_canvas_height);
 }
 
 static void open_connect(void *user) {
@@ -1265,7 +1368,7 @@ static void open_radar(void *user) {
         show_connect();
         return;
     }
-    show_radar();
+    radar_open_requested = true;
 }
 
 static void show_home(void) {
@@ -1298,6 +1401,7 @@ static void radar_start(void) {
     node_count = 0;
     view_slot = 0;
     last_announce_ms = 0;
+    radar_open_requested = false;
     gh_theme_init(api, &theme);
     gh_layout_init(api, &layout);
     app_root = api->ui_screen_create ? api->ui_screen_create("RD-03D Radar") : NULL;
@@ -1343,6 +1447,10 @@ static void radar_input(const ghostesp_input_event_t *event) {
 
 static void radar_tick(uint32_t elapsed_ms) {
     drain_messages();
+    if (radar_open_requested) {
+        radar_open_requested = false;
+        if (selected_count() > 0) show_radar();
+    }
     uint32_t now = now_ms();
     if (page == PAGE_CONNECT) {
         bool changed = refresh_nodes();

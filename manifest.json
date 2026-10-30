@@ -1,9 +1,9 @@
 {
   "id": "rd03d_radar",
   "name": "RD-03D Radar",
-  "version": "0.1.17",
+  "version": "0.1.20",
   "author": "Billi-Green",
-  "description": "Connect to one or more RD-03D ESP-NOW radar nodes and view a 70-degree 2D radar display with 10m range.",
+  "description": "Connect to RD-03D ESP-NOW radar nodes and view a 100-degree radar display with battery status and an 8m display range.",
   "category": "Tools",
   "entry": "rd03d_radar.so",
   "target": "esp32c5",
